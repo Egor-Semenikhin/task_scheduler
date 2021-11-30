@@ -66,7 +66,7 @@ int main()
 
 	scheduler.suspend_all_tasks();
 
-	constexpr size_t Max = 1000000;
+	constexpr size_t Max = 100000000;
 
 	std::vector<task> tasks(Max, task(scheduler));
 
@@ -84,9 +84,9 @@ int main()
 			break;
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
-		scheduler.suspend_all_tasks();
+		//scheduler.suspend_all_tasks();
 		//std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-		scheduler.resume_all_tasks();
+		//scheduler.resume_all_tasks();
 	}
 
 	std::cout << counter << std::endl;
