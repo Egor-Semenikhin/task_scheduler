@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 
 class task_scheduler final
 {
@@ -17,7 +18,9 @@ private:
 private:
 	std::unique_ptr<task_queue[]> _queues;
 	std::unique_ptr<worker_thread[]> _workers;
+	std::mutex _mutexSuspendResume;
 	uint32_t _threadsCount;
+	bool _isSuspended = false;
 
 	static constexpr size_t TASK_QUEUE_ALIGNMENT = 128;
 
@@ -27,6 +30,9 @@ public:
 
 	template <typename TTaskFunction>
 	void schedule_task(TTaskFunction taskFunction);
+
+	void suspend_all_tasks();
+	void resume_all_tasks();
 
 private:
 	void add_task(std::unique_ptr<task_wrapper_base>&& taskWrapper);

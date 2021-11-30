@@ -3,7 +3,6 @@
 #include <atomic>
 #include <queue>
 #include <thread>
-#include <mutex>
 #include <condition_variable>
 #include <cassert>
 
@@ -13,7 +12,8 @@ public:
 	enum class state : uint32_t
 	{
 		normal,
-		worker_sleeping
+		worker_sleeping,
+		worker_suspended
 	};
 
 private:
@@ -42,7 +42,8 @@ private:
 	{
 		ready,
 		stop,
-		sleeping
+		sleeping,
+		suspended
 	};
 
 private:
@@ -57,14 +58,17 @@ public:
 	worker_thread();
 	~worker_thread();
 
-	void start(task_scheduler& scheduler, uint32_t queueIndex);
+	void init(task_scheduler& scheduler, uint32_t queueIndex) noexcept;
 	void wake_up();
+	void suspend();
+	void resume();
 
 private:
 	void thread_func();
 	bool wait_for_initial_wake_up();
 	bool try_to_do_task();
 	bool try_go_to_sleep();
+	bool try_to_suspend();
 };
 
 class task_scheduler::task_queue_holder final
@@ -84,7 +88,7 @@ task_scheduler::task_scheduler(uint32_t threadsCount)
 {
 	for (uint32_t i = 0; i < threadsCount; ++i)
 	{
-		_workers[i].start(*this, i);
+		_workers[i].init(*this, i);
 	}
 }
 
@@ -116,12 +120,14 @@ void task_scheduler::add_task(std::unique_ptr<task_wrapper_base>&& taskWrapper)
 
 				queue.add_task(std::move(taskWrapper));
 
-				if (queue.get_state() == task_queue::state::worker_sleeping)
+				switch (queue.get_state())
 				{
+				case task_queue::state::worker_sleeping:
 					queue.set_state(task_queue::state::normal);
-				}
-				else
-				{
+					break;
+
+				case task_queue::state::normal:
+				case task_queue::state::worker_suspended:
 					return;
 				}
 			}
@@ -129,6 +135,40 @@ void task_scheduler::add_task(std::unique_ptr<task_wrapper_base>&& taskWrapper)
 			_workers[queueIndex].wake_up();
 			return;
 		}
+	}
+}
+
+void task_scheduler::suspend_all_tasks()
+{
+	const std::lock_guard<std::mutex> lock(_mutexSuspendResume);
+
+	if (_isSuspended)
+	{
+		return;
+	}
+
+	_isSuspended = true;
+
+	for (uint32_t i = 0; i < _threadsCount; ++i)
+	{
+		_workers[i].suspend();
+	}
+}
+
+void task_scheduler::resume_all_tasks()
+{
+	const std::lock_guard<std::mutex> lock(_mutexSuspendResume);
+
+	if (!_isSuspended)
+	{
+		return;
+	}
+
+	_isSuspended = false;
+
+	for (uint32_t i = 0; i < _threadsCount; ++i)
+	{
+		_workers[i].resume();
 	}
 }
 
@@ -204,6 +244,7 @@ task_scheduler::worker_thread::~worker_thread()
 		switch (_state)
 		{
 		case state::sleeping:
+		case state::suspended:
 			_state = state::stop;
 			_conditional.notify_one();
 			break;
@@ -221,7 +262,7 @@ task_scheduler::worker_thread::~worker_thread()
 	_thread.join();
 }
 
-void task_scheduler::worker_thread::start(task_scheduler& scheduler, uint32_t queueIndex)
+void task_scheduler::worker_thread::init(task_scheduler& scheduler, uint32_t queueIndex) noexcept
 {
 	_scheduler = &scheduler;
 	_queueIndex = queueIndex;
@@ -229,17 +270,73 @@ void task_scheduler::worker_thread::start(task_scheduler& scheduler, uint32_t qu
 
 void task_scheduler::worker_thread::wake_up()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
+	std::unique_lock<std::mutex> lock(_mutex);
 
-	if (_state == state::sleeping)
+	switch (_state)
 	{
+	[[likely]]
+	case state::sleeping:
 		_state = state::ready;
-	}
-	else
-	{
-		assert(_state == state::stop);
+		break;
+
+	[[unlikely]]
+	case state::stop:
+		break;
+
+	[[unlikely]]
+	case state::suspended:
+		return;
+
+	[[unlikely]]
+	case state::ready:
+		assert(false);
+		break;
 	}
 
+	lock.unlock();
+	_conditional.notify_one();
+}
+
+void task_scheduler::worker_thread::suspend()
+{
+	const std::lock_guard<std::mutex> lock(_mutex);
+
+	switch (_state)
+	{
+	case state::ready:
+		_state = state::suspended;
+		break;
+
+	case state::sleeping:
+		_state = state::suspended;
+		break;
+
+	case state::stop:
+		assert(false);
+		break;
+
+	case state::suspended:
+		assert(false);
+		break;
+	}
+}
+
+void task_scheduler::worker_thread::resume()
+{
+	std::unique_lock<std::mutex> lock(_mutex);
+
+	assert(_state == state::suspended);
+
+	task_queue& queue = _scheduler->_queues[_scheduler->thread_index(_queueIndex)];
+
+	while (!queue.try_capture());
+
+	queue.set_state(task_queue::state::normal);
+	queue.release();
+
+	_state = state::ready;
+
+	lock.unlock();
 	_conditional.notify_one();
 }
 
@@ -253,11 +350,26 @@ void task_scheduler::worker_thread::thread_func()
 	while (true)
 	{
 		const bool next = try_to_do_task();
+		const state currentState = _state;
 
-		if (_state == state::stop)
+		if (currentState == state::stop)
 			[[unlikely]]
 		{
 			return;
+		}
+
+		if (currentState == state::suspended)
+			[[unlikely]]
+		{
+			if (!try_to_suspend())
+				[[unlikely]]
+			{
+				return;
+			}
+			else
+			{
+				continue;
+			}
 		}
 
 		if (next)
@@ -267,6 +379,7 @@ void task_scheduler::worker_thread::thread_func()
 		}
 
 		if (!try_go_to_sleep())
+			[[unlikely]]
 		{
 			return;
 		}
@@ -284,7 +397,7 @@ bool task_scheduler::worker_thread::wait_for_initial_wake_up()
 		[this, &currentState]()
 			{
 				currentState = _state;
-				return currentState != state::sleeping;
+				return currentState == state::ready || currentState == state::stop;
 			}
 		);
 
@@ -363,22 +476,94 @@ bool task_scheduler::worker_thread::try_go_to_sleep()
 
 	std::unique_lock<std::mutex> lock(_mutex);
 
-	if (_state == state::stop)
+	switch (_state)
 	{
+	[[unlikely]] 
+	case state::stop:
+		queue.release();
 		return false;
+
+	[[likely]]
+	case state::ready:
+		_state = state::sleeping;
+		break;
+
+	[[unlikely]]
+	case state::suspended:
+		queue.release();
+		return true;
+
+	[[unlikely]]
+	case state::sleeping:
+		assert(false);
+		break;
 	}
 
-	assert(_state == state::ready);
+	assert(queue.get_state() == task_queue::state::normal);
 
-	_state = state::sleeping;
 	queue.set_state(task_queue::state::worker_sleeping);
-
 	queue.release();
 
 	_conditional.wait(
 		lock,
 		[this]() { return _state != state::sleeping; }
 		);
+
+	return true;
+}
+
+bool task_scheduler::worker_thread::try_to_suspend()
+{
+	task_queue& queue = _scheduler->_queues[_queueIndex];
+
+	if (!queue.try_capture())
+		[[unlikely]]
+	{
+		return true;
+	}
+
+	{
+		std::unique_lock<std::mutex> lock(_mutex);
+	
+		switch (_state)
+		{
+		[[unlikely]] 
+		case state::stop:
+			queue.release();
+			return false;
+
+		[[unlikely]]
+		case state::ready:
+			queue.release();
+			return true;
+
+		[[likely]]
+		case state::suspended:
+			break;
+
+		[[unlikely]]
+		case state::sleeping:
+			assert(false);
+			break;
+		}
+
+		assert(queue.get_state() == task_queue::state::normal);
+
+		queue.set_state(task_queue::state::worker_suspended);
+		queue.release();
+
+		_conditional.wait(
+			lock,
+			[this]() { return _state != state::suspended; }
+			);
+
+		assert(_state == state::ready);
+	}
+
+	while (!queue.try_capture());
+
+	queue.set_state(task_queue::state::normal);
+	queue.release();
 
 	return true;
 }
