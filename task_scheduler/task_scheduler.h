@@ -22,8 +22,6 @@ private:
 	uint32_t _threadsCount;
 	bool _isSuspended = false;
 
-	static constexpr size_t TASK_QUEUE_ALIGNMENT = 128;
-
 public:
 	explicit task_scheduler(uint32_t threadsCount);
 	~task_scheduler();

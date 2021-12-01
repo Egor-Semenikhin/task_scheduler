@@ -6,12 +6,14 @@
 #include <condition_variable>
 #include <cassert>
 
-class task_scheduler::task_queue final
+static constexpr size_t CACHE_LINE_SIZE = 2 * 64;
+
+class alignas(CACHE_LINE_SIZE) task_scheduler::task_queue final
 {
 private:
 	std::atomic<uint32_t> _flag = { 0 };
 
-	alignas(TASK_QUEUE_ALIGNMENT)
+	alignas(CACHE_LINE_SIZE)
 	std::queue<std::unique_ptr<task_wrapper_base>> _tasks;
 
 public:
@@ -23,24 +25,24 @@ public:
 	std::unique_ptr<task_wrapper_base> pop_task() noexcept;
 };
 
-class task_scheduler::worker_thread final
+class alignas(CACHE_LINE_SIZE) task_scheduler::worker_thread final
 {
 private:
 	enum class state : uint32_t
 	{
-		ready,
-		stop,
+		working,
 		sleeping,
-		suspended
+		suspended,
+		stop
 	};
 
 private:
-	std::thread _thread;
+	task_scheduler* _scheduler = nullptr;
+	volatile state _state = state::sleeping;
+	uint32_t _queueIndex = 0;
 	std::mutex _mutex;
 	std::condition_variable _conditional;
-	task_scheduler* _scheduler = nullptr;
-	uint32_t _queueIndex = 0;
-	std::atomic<state> _state = state::sleeping;
+	std::thread _thread;
 
 public:
 	worker_thread();
@@ -71,8 +73,8 @@ public:
 };
 
 task_scheduler::task_scheduler(uint32_t threadsCount)
-	: _queues(new task_queue[threadsCount, TASK_QUEUE_ALIGNMENT])
-	, _workers(new worker_thread[threadsCount])
+	: _queues(new task_queue[threadsCount, CACHE_LINE_SIZE])
+	, _workers(new worker_thread[threadsCount, CACHE_LINE_SIZE])
 	, _threadsCount(threadsCount)
 {
 	for (uint32_t i = 0; i < threadsCount; ++i)
@@ -83,17 +85,22 @@ task_scheduler::task_scheduler(uint32_t threadsCount)
 
 task_scheduler::~task_scheduler()
 {
+	// We don't need to do anything specific here because
+	// by standard it is guaranteed that destructor will be called for _workers first
+	// and then for _queues. So we don't have any potential race conditions.
 }
 
 void task_scheduler::add_task(std::unique_ptr<task_wrapper_base>&& taskWrapper)
 {
 	thread_local uint32_t lastQueueIndex = 0;
 
+	const uint32_t firstQueueIndex = lastQueueIndex % _threadsCount;
+
 	while (true)
 	{
 		for (uint32_t i = 0; i < _threadsCount; ++i)
 		{
-			const uint32_t queueIndex = thread_index(lastQueueIndex + i);
+			const uint32_t queueIndex = thread_index(firstQueueIndex + i);
 			task_queue& queue = _queues[queueIndex];
 
 			if (!queue.try_capture())
@@ -102,7 +109,7 @@ void task_scheduler::add_task(std::unique_ptr<task_wrapper_base>&& taskWrapper)
 				continue;
 			}
 
-			lastQueueIndex = queueIndex + 1;
+			lastQueueIndex = lastQueueIndex + i + 1;
 
 			bool wasEmpty;
 
@@ -224,7 +231,7 @@ task_scheduler::worker_thread::~worker_thread()
 			_conditional.notify_one();
 			break;
 
-		case state::ready:
+		case state::working:
 			_state = state::stop;
 			break;
 
@@ -251,22 +258,22 @@ void task_scheduler::worker_thread::wake_up()
 	{
 	[[likely]]
 	case state::sleeping:
-		_state = state::ready;
+		_state = state::working;
+		lock.unlock();
+		_conditional.notify_one();
 		break;
 
 	[[unlikely]]
 	case state::stop:
-		break;
+		assert(false);	// Very bad situation when some other thread accesses scheduler with already called destructor
+		return;
 
 	[[unlikely]]
 	case state::suspended:
 	[[unlikely]]
-	case state::ready:
-		return;
+	case state::working:
+		break;
 	}
-
-	lock.unlock();
-	_conditional.notify_one();
 }
 
 void task_scheduler::worker_thread::suspend()
@@ -275,7 +282,7 @@ void task_scheduler::worker_thread::suspend()
 
 	switch (_state)
 	{
-	case state::ready:
+	case state::working:
 		_state = state::suspended;
 		break;
 
@@ -299,7 +306,7 @@ void task_scheduler::worker_thread::resume()
 
 	assert(_state == state::suspended);
 
-	_state = state::ready;
+	_state = state::working;
 
 	lock.unlock();
 	_conditional.notify_one();
@@ -314,7 +321,7 @@ void task_scheduler::worker_thread::thread_func()
 
 	while (true)
 	{
-		const bool next = try_to_do_task();
+		const bool goNext = try_to_do_task();
 		const state currentState = _state;
 
 		if (currentState == state::stop)
@@ -337,7 +344,7 @@ void task_scheduler::worker_thread::thread_func()
 			}
 		}
 
-		if (next)
+		if (goNext)
 			[[likely]]
 		{
 			continue;
@@ -429,7 +436,7 @@ bool task_scheduler::worker_thread::try_go_to_sleep()
 			return false;
 
 		[[likely]]
-		case state::ready:
+		case state::working:
 			_state = state::sleeping;
 			break;
 
@@ -458,7 +465,7 @@ bool task_scheduler::worker_thread::try_to_suspend()
 		return false;
 
 	[[unlikely]]
-	case state::ready:
+	case state::working:
 		return true;
 
 	[[likely]]
@@ -482,8 +489,8 @@ bool task_scheduler::worker_thread::wait(std::unique_lock<std::mutex>& lock)
 		[this, &currentState]()
 			{
 				currentState = _state;
-				return currentState == state::ready || currentState == state::stop;
+				return currentState == state::working || currentState == state::stop;
 			}
 		);
-	return currentState == state::ready;
+	return currentState == state::working;
 }

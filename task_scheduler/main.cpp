@@ -66,7 +66,7 @@ int main()
 
 	scheduler.suspend_all_tasks();
 
-	constexpr size_t Max = 100000000;
+	constexpr size_t Max = 1000000;
 
 	std::vector<task> tasks(Max, task(scheduler));
 
