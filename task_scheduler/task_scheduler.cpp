@@ -11,7 +11,7 @@ static constexpr size_t CACHE_LINE_SIZE = 2 * 64;
 class alignas(CACHE_LINE_SIZE) task_scheduler::task_queue final
 {
 private:
-	std::atomic<uint32_t> _flag = { 0 };
+	std::atomic<uint32_t> _flag = 0;
 
 	alignas(CACHE_LINE_SIZE)
 	std::queue<std::unique_ptr<task_wrapper_base>> _tasks;
@@ -73,8 +73,8 @@ public:
 };
 
 task_scheduler::task_scheduler(uint32_t threadsCount)
-	: _queues(new task_queue[threadsCount, CACHE_LINE_SIZE])
-	, _workers(new worker_thread[threadsCount, CACHE_LINE_SIZE])
+	: _queues(new task_queue[threadsCount])
+	, _workers(new worker_thread[threadsCount])
 	, _threadsCount(threadsCount)
 {
 	for (uint32_t i = 0; i < threadsCount; ++i)
@@ -88,6 +88,11 @@ task_scheduler::~task_scheduler()
 	// We don't need to do anything specific here because
 	// by standard it is guaranteed that destructor will be called for _workers first
 	// and then for _queues. So we don't have any potential race conditions.
+}
+
+uint32_t task_scheduler::threads_count() const
+{
+	return _threadsCount;
 }
 
 void task_scheduler::add_task(std::unique_ptr<task_wrapper_base>&& taskWrapper)
@@ -395,7 +400,7 @@ bool task_scheduler::worker_thread::try_to_do_task()
 
 		try
 		{
-			task->do_work();
+			task->do_work(_queueIndex);
 		}
 		catch (...)
 		{

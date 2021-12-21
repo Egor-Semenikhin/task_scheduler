@@ -26,6 +26,8 @@ public:
 	explicit task_scheduler(uint32_t threadsCount);
 	~task_scheduler();
 
+	uint32_t threads_count() const;
+
 	template <typename TTaskFunction>
 	void schedule_task(TTaskFunction taskFunction);
 
@@ -41,7 +43,7 @@ class task_scheduler::task_wrapper_base
 {
 public:
 	virtual ~task_wrapper_base() = default;
-	virtual void do_work() = 0;
+	virtual void do_work(uint32_t workerIndex) = 0;
 };
 
 template <typename TTaskFunction>
@@ -52,7 +54,7 @@ private:
 
 public:
 	explicit task_wrapper(TTaskFunction&& taskFunction) noexcept;
-	void do_work() override;
+	void do_work(uint32_t workerIndex) override;
 };
 
 template <typename TTaskFunction>
@@ -68,7 +70,7 @@ task_scheduler::task_wrapper<TTaskFunction>::task_wrapper(TTaskFunction&& taskFu
 }
 
 template <typename TTaskFunction>
-void task_scheduler::task_wrapper<TTaskFunction>::do_work()
+void task_scheduler::task_wrapper<TTaskFunction>::do_work(uint32_t workerIndex)
 {
-	_taskFunction();
+	_taskFunction(workerIndex);
 }
