@@ -1,12 +1,13 @@
 #include "task_scheduler.h"
 
+#include <mutex>
 #include <atomic>
 #include <queue>
 #include <thread>
 #include <condition_variable>
 #include <cassert>
 
-static constexpr size_t CACHE_LINE_SIZE = 2 * 64;
+static constexpr size_t CACHE_LINE_SIZE = 64;
 
 class alignas(CACHE_LINE_SIZE) task_scheduler::task_queue final
 {
