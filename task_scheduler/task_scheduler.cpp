@@ -32,7 +32,6 @@ private:
 	{
 		working,
 		sleeping,
-		suspended,
 		stop
 	};
 
@@ -50,15 +49,12 @@ public:
 
 	void init(task_scheduler& scheduler, uint32_t queueIndex) noexcept;
 	void wake_up();
-	void suspend();
-	void resume();
 
 private:
 	void thread_func();
 	bool wait_for_initial_wake_up();
 	bool try_to_do_task();
 	bool try_go_to_sleep();
-	bool try_to_suspend();
 	bool wait(std::unique_lock<std::mutex>& lock);
 };
 
@@ -134,40 +130,6 @@ void task_scheduler::add_task(std::unique_ptr<task_wrapper_base>&& taskWrapper)
 	}
 }
 
-void task_scheduler::suspend_all_tasks()
-{
-	const std::lock_guard<std::mutex> lock(_mutexSuspendResume);
-
-	if (_isSuspended)
-	{
-		return;
-	}
-
-	_isSuspended = true;
-
-	for (uint32_t i = 0; i < _threadsCount; ++i)
-	{
-		_workers[i].suspend();
-	}
-}
-
-void task_scheduler::resume_all_tasks()
-{
-	const std::lock_guard<std::mutex> lock(_mutexSuspendResume);
-
-	if (!_isSuspended)
-	{
-		return;
-	}
-
-	_isSuspended = false;
-
-	for (uint32_t i = 0; i < _threadsCount; ++i)
-	{
-		_workers[i].resume();
-	}
-}
-
 uint32_t task_scheduler::thread_index(uint32_t index) const
 {
 	if (index >= _threadsCount)
@@ -230,7 +192,6 @@ task_scheduler::worker_thread::~worker_thread()
 		switch (_state)
 		{
 		case state::sleeping:
-		case state::suspended:
 			_state = state::stop;
 			lock.unlock();
 			_conditional.notify_one();
@@ -274,47 +235,9 @@ void task_scheduler::worker_thread::wake_up()
 		return;
 
 	[[unlikely]]
-	case state::suspended:
-	[[unlikely]]
 	case state::working:
 		break;
 	}
-}
-
-void task_scheduler::worker_thread::suspend()
-{
-	const std::lock_guard<std::mutex> lock(_mutex);
-
-	switch (_state)
-	{
-	case state::working:
-		_state = state::suspended;
-		break;
-
-	case state::sleeping:
-		_state = state::suspended;
-		break;
-
-	case state::stop:
-		assert(false);
-		break;
-
-	case state::suspended:
-		assert(false);
-		break;
-	}
-}
-
-void task_scheduler::worker_thread::resume()
-{
-	std::unique_lock<std::mutex> lock(_mutex);
-
-	assert(_state == state::suspended);
-
-	_state = state::working;
-
-	lock.unlock();
-	_conditional.notify_one();
 }
 
 void task_scheduler::worker_thread::thread_func()
@@ -333,20 +256,6 @@ void task_scheduler::worker_thread::thread_func()
 			[[unlikely]]
 		{
 			return;
-		}
-
-		if (currentState == state::suspended)
-			[[unlikely]]
-		{
-			if (!try_to_suspend())
-				[[unlikely]]
-			{
-				return;
-			}
-			else
-			{
-				continue;
-			}
 		}
 
 		if (goNext)
@@ -446,41 +355,10 @@ bool task_scheduler::worker_thread::try_go_to_sleep()
 			break;
 
 		[[unlikely]]
-		case state::suspended:
-			break;
-
-		[[unlikely]]
 		case state::sleeping:
 			assert(false);
 			break;
 		}
-	}
-
-	return wait(lock);
-}
-
-bool task_scheduler::worker_thread::try_to_suspend()
-{
-	std::unique_lock<std::mutex> lock(_mutex);
-
-	switch (_state)
-	{
-	[[unlikely]]
-	case state::stop:
-		return false;
-
-	[[unlikely]]
-	case state::working:
-		return true;
-
-	[[likely]]
-	case state::suspended:
-		break;
-
-	[[unlikely]]
-	case state::sleeping:
-		assert(false);
-		break;
 	}
 
 	return wait(lock);
